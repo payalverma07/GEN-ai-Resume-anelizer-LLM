@@ -1,0 +1,110 @@
+%%writefile app.py
+import json
+import os
+
+import streamlit as st
+from PyPDF2 import PdfReader
+from google import genai
+
+
+MODEL = "gemini-2.5-flash"
+
+PROMPT_TEMPLATE = """You are an expert ATS (Applicant Tracking System) and career coach.
+Compare the RESUME with the JOB DESCRIPTION below.
+
+Return ONLY valid JSON in exactly this format (no markdown, no extra text):
+{{
+  "match_score": <integer 0-100>,
+  "matched_skills": ["skill1", "skill2"],
+  "missing_skills": ["skill1", "skill2"],
+  "tips": ["tip1", "tip2", "tip3"]
+}}
+
+Rules:
+- match_score reflects how well the resume fits the job description.
+- matched_skills: skills/keywords present in BOTH the resume and the JD.
+- missing_skills: important skills in the JD that are absent from the resume.
+- tips: exactly 3 specific, actionable suggestions to improve the resume for this job.
+
+RESUME:
+{resume}
+
+JOB DESCRIPTION:
+{jd}
+"""
+
+
+def extract_text(pdf_file) -> str:
+    reader = PdfReader(pdf_file)
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return "\n".join(pages).strip()
+
+
+def analyze(resume_text: str, jd_text: str, api_key: str) -> dict:
+    client = genai.Client(api_key=api_key)
+    prompt = PROMPT_TEMPLATE.format(resume=resume_text, jd=jd_text)
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config={"response_mime_type": "application/json", "temperature": 0.2},
+    )
+    text = response.text.strip()
+    # Strip code fences if the model adds them anyway
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    return json.loads(text)
+
+
+# ---------------- UI ----------------
+st.set_page_config(page_title="Resume Analyzer", page_icon="📄", layout="centered")
+st.title("📄 Resume Analyzer")
+st.caption("Find out how well your resume matches a job description.")
+
+api_key = os.getenv("GEMINI_API_KEY") or st.sidebar.text_input(
+    "Gemini API key", type="password"
+)
+
+uploaded = st.file_uploader("Upload your resume (PDF)", type=["pdf"])
+jd = st.text_area("Paste the job description", height=250)
+
+if st.button("Analyze", type="primary"):
+    if not api_key:
+        st.error("Please provide a Gemini API key.")
+    elif not uploaded:
+        st.error("Please upload your resume PDF.")
+    elif not jd.strip():
+        st.error("Please paste the job description.")
+    else:
+        try:
+            resume_text = extract_text(uploaded)
+            if not resume_text:
+                st.error("Could not read text from this PDF (it may be a scanned image).")
+                st.stop()
+
+            with st.spinner("Analyzing..."):
+                result = analyze(resume_text, jd, api_key)
+
+            score = max(0, min(100, int(result.get("match_score", 0))))
+            st.subheader(f"Match Score: {score}%")
+            st.progress(score / 100)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("### ✅ Matched Skills")
+                for s in result.get("matched_skills", []):
+                    st.write(f"- {s}")
+            with col2:
+                st.markdown("### ❌ Missing Skills")
+                for s in result.get("missing_skills", []):
+                    st.write(f"- {s}")
+
+            st.markdown("### 💡 Tips to Improve")
+            for i, tip in enumerate(result.get("tips", []), 1):
+                st.write(f"{i}. {tip}")
+
+        except json.JSONDecodeError:
+            st.error("The model returned invalid JSON. Please try again.")
+        except Exception as e:
+            st.error(f"Something went wrong: {e}")
